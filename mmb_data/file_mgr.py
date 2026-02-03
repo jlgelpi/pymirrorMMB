@@ -16,10 +16,11 @@ class FileMgr():
         self.current_line = 0
         
     def check_new_stamp(self, tstamp_col):
+        ''' Check if the file has a new time stamp compared to the stored one '''
         stored_tstamp = tstamp_col.find_one({'_id':self.fn})
-        logging.info('File time stamp:   {:11.0f}'.format(self.tstamp))
+        logging.info(f'File time stamp:   {self.tstamp:11.0f}')
         if stored_tstamp:
-            logging.info('Stored time stamp: {:11.0f}'.format(stored_tstamp['ts']))
+            logging.info(f"Stored time stamp: {stored_tstamp['ts']:11.0f}")
             if self.tstamp <= stored_tstamp['ts']:
                 return False
         if not stored_tstamp:
@@ -27,6 +28,7 @@ class FileMgr():
         return True
     
     def skip_lines_to(self, txt, match=False):
+        ''' Skip lines until a line matches (or not matches) the given text '''
         header_lines = True
         for line in self:
         #    print(line)
@@ -38,12 +40,14 @@ class FileMgr():
                 break
 
     def skip_lines_to_ini(self):
+        ''' Skip lines until the initial line number '''
         if self.ini:
             for line in self:
                 if self.current_line >= self.ini:
                     break
                     
     def skip_n_lines(self,n):
+        ''' Skip n lines '''
         nlin=0
         for line in self:
             if nlin == n:
@@ -51,6 +55,7 @@ class FileMgr():
             nlin += 1
     
     def open_file(self):
+        ''' Open the file for reading '''
         try:
             if self.fn.find('.gz') != -1:
                 self.fh_in = gzip.open(self.fn, 'rt')
@@ -61,6 +66,7 @@ class FileMgr():
         
 
     def close_file(self):
+        ''' Close the file '''
         self.fh_in.close()
 
         
@@ -76,4 +82,4 @@ class FileMgr():
 
     def __iter__(self):
         return self
-    
+
