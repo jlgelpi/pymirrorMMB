@@ -10,7 +10,7 @@ import os
 import gzip
 import sys
 
-from mmb_data.mongo_db_connect import Mongo_db
+from mmb_data.mongo_db_connect import MongoDB
 from mmb_data.mongo_db_bulk_write import CTS, MongoDBBulkWrite
 from mmb_data.file_mgr import FileMgr
 import mmb_data.utils as ut
@@ -32,7 +32,7 @@ cmd.add_argument('files', nargs=argparse.REMAINDER, help="Files to process (FAST
 
 args = cmd.parse_args()
 
-db_lnk = Mongo_db('localhost', 'FlexPortal', False, AUTH)
+db_lnk = MongoDB('localhost', 'FlexPortal', False, AUTH)
 db_cols = db_lnk.get_collections(["headers", "sequences", "sources","annotation", "fileStamps"])
 
 logging.basicConfig(stream=sys.stdout, format='[%(asctime)s] %(levelname)s %(message)s', datefmt='%Y-%m-%d|%H:%M:%S')
