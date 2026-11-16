@@ -4,17 +4,20 @@
 """Updates checking data from new cif files."""
 
 import argparse
+from contextlib import redirect_stdout
+from io import StringIO
 import logging
 import os
 import sys
+from urllib.request import urlopen
 
 from mmb_data.mongo_db_connect import MongoDB
-
-from biobb_structure_checking.constants import help, set_defaults
+import biobb_structure_checking
+import biobb_structure_checking.constants as cts
 from biobb_structure_checking.structure_checking import StructureChecking
 
 AUTH = True
-
+TMPDIR = "/tmp"
 BUCKETS = {
     "assemblies" : "PDB_Assemblies",
     "structures" : "PDB_DataFiles",
@@ -22,15 +25,68 @@ BUCKETS = {
 
 CHECKING_COL = "PDB_Checking"
 ENTRIES_COL = "PDB_Entry"
-ASSEMBLIES_COL = "PDB_Assemblies.files"
+API_PREFIX = "https://mdb-login.bsc.es/api/pdb"
 
-def fetch_codes(col, query={}):
-    return list(col.find(query, projection={'_id':1}))
 
-def fetch_assemblies_codes(pdb_codes, ass_col):
-    files = set(fetch_codes(ass_col, query={'filename': '/cif/'}))
-    print(f"Fetched {len(files)} assembly files from {ASSEMBLIES_COL}")
-        
+def fetch_codes(col, query={}, projection={'_id':1}):
+    return list(col.find(query, projection=projection))
+
+def get_assemblies_codes(pdb_entries):
+    ass_codes = []
+    for code in pdb_entries:
+        if code.get('assemblies'):
+            ass_codes.extend(code['assemblies'])
+    return [code.replace('-assembly', '_').upper() for code in ass_codes]
+
+def update_checking_data(args, codes, chk_col):
+    """Update checking data for the given codes."""
+    base_dir_path = biobb_structure_checking.__path__[0]
+    settings = cts.set_defaults(base_dir_path)
+    settings['no_network']=False
+    settings['nocache']=True
+    settings['check_only']=True
+    settings['non_interactive']=True
+    settings['cache_dir']=TMPDIR
+    settings['limit']=args.atom_limit
+    base_path = TMPDIR
+
+    for pdb_id in codes:
+        logging.info(f"Processing code: {pdb_id}")
+        try:
+            # Fetch the cif file from the API
+            base_path = TMPDIR
+            pdb_id = pdb_id.upper()
+            cif_url = f"{args.api_prefix}/{pdb_id}.cif"
+            settings['input_structure_path'] = cif_url
+            logging.info(f"Fetching CIF file from {cif_url}")
+            try:
+                # Attempt to fetch the CIF file to ensure it exists
+                with urlopen(cif_url) as response:
+                    if response.status != 200:
+                        raise ValueError(f"Unexpected HTTP status: {response.status}")
+            except Exception as e:
+                logging.error(f"Error fetching CIF file for code {pdb_id}: {e}")
+                continue
+          
+            # Perform structure checking
+            try:
+                output = StringIO()
+                with redirect_stdout(output):
+                    checker = StructureChecking(base_path, settings)
+                    checker.checkall()
+                checker.summary['report'] = output.getvalue()
+            except Exception as e:
+                logging.error(f"Error checking structure for code {pdb_id}: {e}")
+                continue
+            try:
+                chk_col.update_one({'_id': pdb_id}, {'$set': checker.summary}, upsert=True)
+                logging.info(f"Updated checking data for code {pdb_id}")
+            except Exception as e:
+                logging.error(f"Error updating checking data for code {pdb_id}: {e}")
+                continue
+        except Exception as e:
+            logging.error(f"Error processing code {pdb_id}: {e}")
+            continue
 
 
 def main():
@@ -40,13 +96,6 @@ def main():
     )
     cmd.add_argument(
         "-d", "--debug", action="store_true", default=False
-    )
-    cmd.add_argument(
-        "-c",
-        "--command",
-        type=str,
-        help="Command to execute: default checkall",
-        default="checkall"
     )
     cmd.add_argument(
         "--atom_limit",
@@ -63,12 +112,26 @@ def main():
         default="both", 
         choices=['assemblies', 'structures', 'both']
     )
+    cmd.add_argument(
+        "--force", 
+        action="store_true", 
+        help="Force update of checking data even if it already exists (default: False)", 
+        default=False
+    )
+    cmd.add_argument(
+        "--api_prefix", 
+        action="store", 
+        type=str, 
+        help="API prefix for fetching cif files (default: https://mdb-login.bsc.es/api/pdb)", 
+        default=API_PREFIX
+    )
     cmd.add_argument("--host", default="localhost", help="MongoDB host (default: localhost)")
     cmd.add_argument("--database", default="FlexPortal", help="MongoDB database (default: FlexPortal)")
     
     args = cmd.parse_args()
 
     logging.basicConfig(
+        level=logging.INFO,
         stream=sys.stdout,
         format="[%(asctime)s] %(levelname)s %(message)s",
         datefmt="%Y-%m-%d|%H:%M:%S",
@@ -76,38 +139,61 @@ def main():
     logging.getLogger().setLevel(10 if args.debug else 20)
 
     # Connect to MongoDB
-    logging.info(f"Connecting to MongoDB database {args.database} at {args.host}")
-    db_lnk = MongoDB(args.host, args.database, False, AUTH)
-    db_lnk.connect_db()
-    
-    ass_bucket = db_lnk.get_gfs(BUCKETS['assemblies'])
-    cif_bucket = db_lnk.get_gfs(BUCKETS['structures'])
-    
-    cols = db_lnk.get_collections([CHECKING_COL, ENTRIES_COL, ASSEMBLIES_COL])
-    chk_col = cols[CHECKING_COL]
-    ent_col = cols[ENTRIES_COL]
-    ass_col = cols[ASSEMBLIES_COL]
-       
-    chk_codes = fetch_codes(chk_col)
-    logging.info(f"Fetched {len(chk_codes)} from {CHECKING_COL}")
-    
-    pdb_codes = fetch_codes(ent_col)
-    logging.info(f"Fetched {len(pdb_codes)} from {ENTRIES_COL}")
-    
-    ass_codes = []
+    try:
+        logging.info(f"Connecting to MongoDB database {args.database} at {args.host}")
+        db_lnk = MongoDB(args.host, args.database, False, AUTH)
+        db_lnk.connect_db()
+        cols = db_lnk.get_collections([CHECKING_COL, ENTRIES_COL])
+        chk_col = cols[CHECKING_COL]
+        ent_col = cols[ENTRIES_COL]
+    except Exception as e:
+        logging.error(f"Error connecting to MongoDB: {e}")
+        sys.exit(1)
 
+    try:
+        logging.info(f"Fetching codes from {CHECKING_COL} and {ENTRIES_COL}")
+        
+        chk_codes = set(code['_id'].upper() for code in fetch_codes(chk_col))
+        logging.info(f"Fetched {len(chk_codes)} codes from {CHECKING_COL}")
+        
+        pdb_entries = fetch_codes(
+            ent_col, 
+            query={'supersby':{'$exists' : 0}},
+            projection={'assemblies':1, '_id':1}
+        )
+        pdb_codes = [code['_id'].upper() for code in pdb_entries]
+
+        
+        logging.info(f"Fetched {len(pdb_codes)} codes from {ENTRIES_COL}")
+    except Exception as e:
+        logging.error(f"Error fetching codes: {e}")
+        sys.exit(1)
+    
     if args.which in ["assemblies", "both"]:
-        ass_codes = fetch_assembly_codes(pdb_codes, ass_col)
-        logging.info(f"Fetched {len(ass_codes)} from assemblies")
+        ass_codes = get_assemblies_codes(pdb_entries)
+        logging.info(f"Fetched {len(ass_codes)} assemblies")
+
     if args.which == 'assemblies':
         to_do = ass_codes
     elif args.which == 'structures':
         to_do = pdb_codes
     else:
-        to_do = set(pdb_codes) + set(ass_codes)
+        to_do = list(pdb_codes) + list(ass_codes)
+
+    if not args.force:
+        to_do_filtered = [code for code in to_do if code not in chk_codes]
+        logging.info(f"Filtered {len(to_do_filtered)} codes to process (excluding already checked codes)")
+        print(to_do_filtered[0:10])
+    else:
+        to_do_filtered = to_do
+        logging.info(f"Force update enabled, processing all {len(to_do)} codes")
     
-        
-        
+        logging.info(f"Processing {len(to_do_filtered)} total codes")
+
+    logging.info(f"Initializing checking process...")
+
+    update_checking_data(args, to_do_filtered, chk_col)
+    
     
 if __name__ == "__main__":
     main()
