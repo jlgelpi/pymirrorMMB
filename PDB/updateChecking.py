@@ -44,10 +44,10 @@ def fetch_structure_cif(pdb_id, api_prefix, cif_gfs=None, ass_gfs=None):
         if '_' in pdb_id:
             # It's an assembly
             fn = f"{pdb_id.replace('_','-assembly')}.cif.gz"
-            grid_out = ass_gfs.get_last_version(fn)
+            grid_out = ass_gfs.open_download_stream_by_name(fn)
         else:
             fn = f"{pdb_id.lower()}.cif.gz"
-            grid_out = cif_gfs.get_last_version(fn)
+            grid_out = cif_gfs.open_download_stream_by_name(fn)
         cif_data = grid_out.read()
         cif_path = os.path.join(TMPDIR, fn)
         with open(cif_path, "wb") as cif_file:
@@ -74,20 +74,20 @@ def update_checking_data(
         ass_gfs=None
     ):
     """Update checking data for the given codes."""
-    settings = cts.set_defaults(base_dir_path)
+    base_dir_path = biobb_structure_checking.__path__[0]
+    settings = cts.set_defaults(base_dir_path=base_dir_path)
     settings['no_network']=False
     settings['nocache']=True
     settings['check_only']=True
     settings['non_interactive']=True
     settings['cache_dir']=TMPDIR
     settings['limit']=args.atom_limit
-    base_path = TMPDIR
 
     for pdb_id in codes:
         logging.info(f"Processing code: {pdb_id}")
         try:
             # Fetch the cif file from the API
-            base_path = TMPDIR
+            tmp_path = TMPDIR
             str_file = fetch_structure_cif(pdb_id, args.api_prefix, cif_gfs=cif_gfs, ass_gfs=ass_gfs)
             settings['input_structure_path'] = str_file
           
@@ -95,7 +95,7 @@ def update_checking_data(
             try:
                 output = StringIO()
                 with redirect_stdout(output):
-                    checker = StructureChecking(base_path, settings)
+                    checker = StructureChecking(base_dir_path, settings)
                     checker.checkall()
                 checker.summary['report'] = output.getvalue()
             except Exception as e:
@@ -107,10 +107,12 @@ def update_checking_data(
             except Exception as e:
                 logging.error(f"Error updating checking data for code {pdb_id}: {e}")
                 continue
+            # Remove the temporary cif file
+            # os.remove(str_file)
+            sys.exit(0)
         except Exception as e:
             logging.error(f"Error processing code {pdb_id}: {e}")
             continue
-
 
 def main():
     """Parse arguments and sync files to GridFS."""
