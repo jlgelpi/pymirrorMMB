@@ -38,9 +38,42 @@ def get_assemblies_codes(pdb_entries):
             ass_codes.extend(code['assemblies'])
     return [code.replace('-assembly', '_').upper() for code in ass_codes]
 
-def update_checking_data(args, codes, chk_col):
+def fetch_structure_cif(pdb_id, api_prefix, cif_gfs=None, ass_gfs=None):
+    if cif_gfs is not None:
+        # Fetch from GridFS
+        if '_' in pdb_id:
+            # It's an assembly
+            fn = f"{pdb_id.replace('_','-assembly')}.cif.gz"
+            grid_out = ass_gfs.get_last_version(fn)
+        else:
+            fn = f"{pdb_id.lower()}.cif.gz"
+            grid_out = cif_gfs.get_last_version(fn)
+        cif_data = grid_out.read()
+        cif_path = os.path.join(TMPDIR, fn)
+        with open(cif_path, "wb") as cif_file:
+            cif_file.write(cif_data)
+
+    else:
+        cif_url = f"{api_prefix}/{pdb_id}.cif"
+        logging.info(f"Fetching CIF file from {cif_url}")
+        with urlopen(cif_url) as response:
+            if response.status != 200:
+                raise ValueError(f"Unexpected HTTP status: {response.status}")
+            cif_data = response.read()
+        cif_path = os.path.join(TMPDIR, f"{pdb_id}.cif")
+
+    with open(cif_path, "wb") as cif_file:
+        cif_file.write(cif_data)
+    return cif_path
+
+def update_checking_data(
+        args, 
+        codes, 
+        chk_col, 
+        cif_gfs=None, 
+        ass_gfs=None
+    ):
     """Update checking data for the given codes."""
-    base_dir_path = biobb_structure_checking.__path__[0]
     settings = cts.set_defaults(base_dir_path)
     settings['no_network']=False
     settings['nocache']=True
@@ -55,18 +88,8 @@ def update_checking_data(args, codes, chk_col):
         try:
             # Fetch the cif file from the API
             base_path = TMPDIR
-            pdb_id = pdb_id.upper()
-            cif_url = f"{args.api_prefix}/{pdb_id}.cif"
-            settings['input_structure_path'] = cif_url
-            logging.info(f"Fetching CIF file from {cif_url}")
-            try:
-                # Attempt to fetch the CIF file to ensure it exists
-                with urlopen(cif_url) as response:
-                    if response.status != 200:
-                        raise ValueError(f"Unexpected HTTP status: {response.status}")
-            except Exception as e:
-                logging.error(f"Error fetching CIF file for code {pdb_id}: {e}")
-                continue
+            str_file = fetch_structure_cif(pdb_id, args.api_prefix, cif_gfs=cif_gfs, ass_gfs=ass_gfs)
+            settings['input_structure_path'] = str_file
           
             # Perform structure checking
             try:
@@ -127,7 +150,7 @@ def main():
     )
     cmd.add_argument("--host", default="localhost", help="MongoDB host (default: localhost)")
     cmd.add_argument("--database", default="FlexPortal", help="MongoDB database (default: FlexPortal)")
-    
+    cmd.add_argument("--use_gfs", action="store_true", help="Use GridFS for retrieving files")
     args = cmd.parse_args()
 
     logging.basicConfig(
@@ -146,6 +169,13 @@ def main():
         cols = db_lnk.get_collections([CHECKING_COL, ENTRIES_COL])
         chk_col = cols[CHECKING_COL]
         ent_col = cols[ENTRIES_COL]
+        cif_gfs = None
+        ass_gfs = None
+        if args.use_gfs:
+            logging.info("Using GridFS for file retrieval")
+            cif_gfs = db_lnk.get_gfs(BUCKETS['structures'])
+            ass_gfs = db_lnk.get_gfs(BUCKETS['assemblies'])
+
     except Exception as e:
         logging.error(f"Error connecting to MongoDB: {e}")
         sys.exit(1)
@@ -192,7 +222,7 @@ def main():
 
     logging.info(f"Initializing checking process...")
 
-    update_checking_data(args, to_do_filtered, chk_col)
+    update_checking_data(args, to_do_filtered, chk_col, cif_gfs=cif_gfs, ass_gfs=ass_gfs)
     
     
 if __name__ == "__main__":
