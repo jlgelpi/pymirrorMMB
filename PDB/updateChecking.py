@@ -4,11 +4,15 @@
 """Updates checking data from new cif files."""
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import redirect_stdout
 from io import StringIO
 import logging
+import multiprocessing
 import os
+import shutil
 import sys
+import tempfile
 from urllib.request import urlopen
 
 from mmb_data.mongo_db_connect import MongoDB
@@ -38,7 +42,7 @@ def get_assemblies_codes(pdb_entries):
             ass_codes.extend(code['assemblies'])
     return [code.replace('-assembly', '_').upper() for code in ass_codes]
 
-def fetch_structure_cif(pdb_id, api_prefix, cif_gfs=None, ass_gfs=None):
+def fetch_structure_cif(pdb_id, api_prefix, cif_gfs=None, ass_gfs=None, output_dir=TMPDIR):
     if cif_gfs is not None:
         # Fetch from GridFS
         if '_' in pdb_id:
@@ -49,7 +53,7 @@ def fetch_structure_cif(pdb_id, api_prefix, cif_gfs=None, ass_gfs=None):
             fn = f"{pdb_id.lower()}.cif.gz"
             grid_out = cif_gfs.open_download_stream_by_name(fn)
         cif_data = grid_out.read()
-        cif_path = os.path.join(TMPDIR, fn)
+        cif_path = os.path.join(output_dir, fn)
         with open(cif_path, "wb") as cif_file:
             cif_file.write(cif_data)
 
@@ -60,11 +64,28 @@ def fetch_structure_cif(pdb_id, api_prefix, cif_gfs=None, ass_gfs=None):
             if response.status != 200:
                 raise ValueError(f"Unexpected HTTP status: {response.status}")
             cif_data = response.read()
-        cif_path = os.path.join(TMPDIR, f"{pdb_id}.cif")
+        cif_path = os.path.join(output_dir, f"{pdb_id}.cif")
 
     with open(cif_path, "wb") as cif_file:
         cif_file.write(cif_data)
     return cif_path
+
+def check_structure(base_dir_path, atom_limit, cache_dir, str_file):
+    settings = cts.set_defaults(base_dir_path=base_dir_path)
+    settings['no_network'] = False
+    settings['nocache'] = True
+    settings['check_only'] = True
+    settings['non_interactive'] = True
+    settings['cache_dir'] = cache_dir
+    settings['limit'] = atom_limit
+    settings['input_structure_path'] = str_file
+
+    output = StringIO()
+    with redirect_stdout(output):
+        checker = StructureChecking(base_dir_path, settings)
+        checker.checkall()
+    checker.summary['report'] = output.getvalue()
+    return checker.summary
 
 def update_checking_data(
         args, 
@@ -75,52 +96,74 @@ def update_checking_data(
     ):
     """Update checking data for the given codes."""
     base_dir_path = biobb_structure_checking.__path__[0]
-    settings = cts.set_defaults(base_dir_path=base_dir_path)
-    settings['no_network']=False
-    settings['nocache']=True
-    settings['check_only']=True
-    settings['non_interactive']=True
-    settings['cache_dir']=TMPDIR
-    settings['limit']=args.atom_limit
+    workers = min(args.workers, len(codes)) if codes else 1
 
-    for pdb_id in codes:
-        logging.info(f"Processing code: {pdb_id}")
-        try:
-            # Fetch the cif file from the API
-            try:
-                tmp_path = TMPDIR
-                str_file = fetch_structure_cif(pdb_id, args.api_prefix, cif_gfs=cif_gfs, ass_gfs=ass_gfs)
-                settings['input_structure_path'] = str_file
-            except Exception as e:
-                logging.error(f"Error fetching CIF file for code {pdb_id}: {e}")
-                continue
-         
-            # Perform structure checking
-            try:
-                output = StringIO()
-                with redirect_stdout(output):
-                    checker = StructureChecking(base_dir_path, settings)
-                    checker.checkall()
-                checker.summary['report'] = output.getvalue()
-            except SystemExit as e:
-                logging.error(f"Structure checking failed for code {pdb_id}: {e}")
-                continue
-            except Exception as e:
-                logging.error(f"Error checking structure for code {pdb_id}: {e}")
-                continue
-            
-            try:
-                chk_col.update_one({'_id': pdb_id}, {'$set': checker.summary}, upsert=True)
-                logging.info(f"Updated checking data for code {pdb_id}")
-            except Exception as e:
-                logging.error(f"Error updating checking data for code {pdb_id}: {e}")
-                continue
+    with ThreadPoolExecutor(max_workers=workers) as fetch_pool, \
+            ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=multiprocessing.get_context("spawn")
+            ) as check_pool:
+        for batch_start in range(0, len(codes), workers):
+            batch = codes[batch_start:batch_start + workers]
+            directories = []
+            fetch_futures = {}
+            results = [None] * len(batch)
 
-            # Remove the temporary cif file
-            os.remove(str_file)
-        except Exception as e:
-            logging.error(f"Error processing code {pdb_id}: {e}")
-            continue
+            for index, pdb_id in enumerate(batch):
+                logging.info(f"Processing code: {pdb_id}")
+                tmp_dir = tempfile.mkdtemp(prefix=f"pdb-{pdb_id}-", dir=TMPDIR)
+                directories.append(tmp_dir)
+                future = fetch_pool.submit(
+                    fetch_structure_cif,
+                    pdb_id,
+                    args.api_prefix,
+                    cif_gfs=cif_gfs,
+                    ass_gfs=ass_gfs,
+                    output_dir=tmp_dir
+                )
+                fetch_futures[future] = (index, pdb_id)
+
+            check_futures = {}
+            for future in as_completed(fetch_futures):
+                index, pdb_id = fetch_futures[future]
+                try:
+                    str_file = future.result()
+                    check_future = check_pool.submit(
+                        check_structure,
+                        base_dir_path,
+                        args.atom_limit,
+                        directories[index],
+                        str_file
+                    )
+                    check_futures[check_future] = (index, pdb_id)
+                except Exception as e:
+                    logging.error(f"Error fetching CIF file for code {pdb_id}: {e}")
+
+            for future in as_completed(check_futures):
+                index, pdb_id = check_futures[future]
+                try:
+                    results[index] = ("ok", future.result())
+                except SystemExit as e:
+                    logging.error(f"Structure checking failed for code {pdb_id}: {e}")
+                except Exception as e:
+                    logging.error(f"Error checking structure for code {pdb_id}: {e}")
+
+            for index, (pdb_id, result) in enumerate(zip(batch, results)):
+                try:
+                    if result is not None and result[0] == "ok":
+                        chk_col.update_one(
+                            {'_id': pdb_id},
+                            {'$set': result[1]},
+                            upsert=True
+                        )
+                        logging.info(f"Updated checking data for code {pdb_id}")
+                except Exception as e:
+                    logging.error(f"Error updating checking data for code {pdb_id}: {e}")
+                finally:
+                    try:
+                        shutil.rmtree(directories[index])
+                    except OSError as e:
+                        logging.error(f"Error removing temporary files for code {pdb_id}: {e}")
 
 def main():
     """Parse arguments and sync files to GridFS."""
@@ -136,6 +179,12 @@ def main():
         type=int,
         help="Max number of atoms to include in the update (default: 1000000).",
         default=1000000
+    )
+    cmd.add_argument(
+        "--workers",
+        type=int,
+        help="Maximum number of CIF downloads and structure checks to run concurrently.",
+        default=2
     )
     cmd.add_argument(
         "--which", 
@@ -162,6 +211,8 @@ def main():
     cmd.add_argument("--database", default="FlexPortal", help="MongoDB database (default: FlexPortal)")
     cmd.add_argument("--use_gfs", action="store_true", help="Use GridFS for retrieving files")
     args = cmd.parse_args()
+    if args.workers < 1:
+        cmd.error("--workers must be at least 1")
 
     logging.basicConfig(
         level=logging.INFO,
