@@ -4,7 +4,8 @@
 """Updates checking data from new cif files."""
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from contextlib import redirect_stdout
 from io import StringIO
 import logging
@@ -87,6 +88,12 @@ def check_structure(base_dir_path, atom_limit, cache_dir, str_file):
     checker.summary['report'] = output.getvalue()
     return checker.summary
 
+def cleanup_temp_dir(pdb_id, tmp_dir):
+    try:
+        shutil.rmtree(tmp_dir)
+    except OSError as e:
+        logging.error(f"Error removing temporary files for code {pdb_id}: {e}")
+
 def update_checking_data(
         args, 
         codes, 
@@ -96,6 +103,9 @@ def update_checking_data(
     ):
     """Update checking data for the given codes."""
     base_dir_path = biobb_structure_checking.__path__[0]
+    codes = list(codes)
+    if args.workers < 1:
+        raise ValueError("workers must be at least 1")
     workers = min(args.workers, len(codes)) if codes else 1
 
     with ThreadPoolExecutor(max_workers=workers) as fetch_pool, \
@@ -103,67 +113,84 @@ def update_checking_data(
                 max_workers=workers,
                 mp_context=multiprocessing.get_context("spawn")
             ) as check_pool:
-        for batch_start in range(0, len(codes), workers):
-            batch = codes[batch_start:batch_start + workers]
-            directories = []
-            fetch_futures = {}
-            results = [None] * len(batch)
+        fetch_futures = {}
+        check_futures = {}
+        ready_checks = deque()
+        next_code = 0
 
-            for index, pdb_id in enumerate(batch):
-                logging.info(f"Processing code: {pdb_id}")
-                tmp_dir = tempfile.mkdtemp(prefix=f"pdb-{pdb_id}-", dir=TMPDIR)
-                directories.append(tmp_dir)
-                future = fetch_pool.submit(
-                    fetch_structure_cif,
-                    pdb_id,
-                    args.api_prefix,
-                    cif_gfs=cif_gfs,
-                    ass_gfs=ass_gfs,
-                    output_dir=tmp_dir
-                )
-                fetch_futures[future] = (index, pdb_id)
-
-            check_futures = {}
-            for future in as_completed(fetch_futures):
-                index, pdb_id = fetch_futures[future]
+        while next_code < len(codes) or fetch_futures or check_futures or ready_checks:
+            while ready_checks and len(check_futures) < workers:
+                pdb_id, tmp_dir, str_file = ready_checks.popleft()
                 try:
-                    str_file = future.result()
-                    check_future = check_pool.submit(
+                    future = check_pool.submit(
                         check_structure,
                         base_dir_path,
                         args.atom_limit,
-                        directories[index],
+                        tmp_dir,
                         str_file
                     )
-                    check_futures[check_future] = (index, pdb_id)
+                    check_futures[future] = (pdb_id, tmp_dir)
                 except Exception as e:
-                    logging.error(f"Error fetching CIF file for code {pdb_id}: {e}")
+                    logging.error(f"Error scheduling structure check for code {pdb_id}: {e}")
+                    cleanup_temp_dir(pdb_id, tmp_dir)
 
-            for future in as_completed(check_futures):
-                index, pdb_id = check_futures[future]
+            while (
+                next_code < len(codes)
+                and len(fetch_futures) < workers
+                and len(check_futures) + len(ready_checks) < 2 * workers
+            ):
+                index = next_code
+                pdb_id = codes[index]
+                next_code += 1
+                logging.info(f"Processing code: {pdb_id}")
+                tmp_dir = tempfile.mkdtemp(prefix=f"pdb-{pdb_id}-", dir=TMPDIR)
                 try:
-                    results[index] = ("ok", future.result())
+                    future = fetch_pool.submit(
+                        fetch_structure_cif,
+                        pdb_id,
+                        args.api_prefix,
+                        cif_gfs=cif_gfs,
+                        ass_gfs=ass_gfs,
+                        output_dir=tmp_dir
+                    )
+                    fetch_futures[future] = (pdb_id, tmp_dir)
+                except Exception as e:
+                    logging.error(f"Error scheduling CIF fetch for code {pdb_id}: {e}")
+                    cleanup_temp_dir(pdb_id, tmp_dir)
+
+            pending = set(fetch_futures) | set(check_futures)
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+
+            for future in completed:
+                if future in fetch_futures:
+                    pdb_id, tmp_dir = fetch_futures.pop(future)
+                    try:
+                        str_file = future.result()
+                        ready_checks.append((pdb_id, tmp_dir, str_file))
+                    except Exception as e:
+                        logging.error(f"Error fetching CIF file for code {pdb_id}: {e}")
+                        cleanup_temp_dir(pdb_id, tmp_dir)
+                    continue
+
+                pdb_id, tmp_dir = check_futures.pop(future)
+                try:
+                    summary = future.result()
                 except SystemExit as e:
                     logging.error(f"Structure checking failed for code {pdb_id}: {e}")
                 except Exception as e:
                     logging.error(f"Error checking structure for code {pdb_id}: {e}")
-
-            for index, (pdb_id, result) in enumerate(zip(batch, results)):
-                try:
-                    if result is not None and result[0] == "ok":
+                else:
+                    try:
                         chk_col.update_one(
                             {'_id': pdb_id},
-                            {'$set': result[1]},
+                            {'$set': summary},
                             upsert=True
                         )
                         logging.info(f"Updated checking data for code {pdb_id}")
-                except Exception as e:
-                    logging.error(f"Error updating checking data for code {pdb_id}: {e}")
+                    except Exception as e:
+                        logging.error(f"Error updating checking data for code {pdb_id}: {e}")
                 finally:
-                    try:
-                        shutil.rmtree(directories[index])
-                    except OSError as e:
-                        logging.error(f"Error removing temporary files for code {pdb_id}: {e}")
+                    cleanup_temp_dir(pdb_id, tmp_dir)
 
 def main():
     """Parse arguments and sync files to GridFS."""
