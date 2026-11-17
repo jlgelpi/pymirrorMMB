@@ -87,10 +87,14 @@ def update_checking_data(
         logging.info(f"Processing code: {pdb_id}")
         try:
             # Fetch the cif file from the API
-            tmp_path = TMPDIR
-            str_file = fetch_structure_cif(pdb_id, args.api_prefix, cif_gfs=cif_gfs, ass_gfs=ass_gfs)
-            settings['input_structure_path'] = str_file
-          
+            try:
+                tmp_path = TMPDIR
+                str_file = fetch_structure_cif(pdb_id, args.api_prefix, cif_gfs=cif_gfs, ass_gfs=ass_gfs)
+                settings['input_structure_path'] = str_file
+            except Exception as e:
+                logging.error(f"Error fetching CIF file for code {pdb_id}: {e}")
+                continue
+         
             # Perform structure checking
             try:
                 output = StringIO()
@@ -98,18 +102,22 @@ def update_checking_data(
                     checker = StructureChecking(base_dir_path, settings)
                     checker.checkall()
                 checker.summary['report'] = output.getvalue()
+            except SystemExit as e:
+                logging.error(f"Structure checking failed for code {pdb_id}: {e}")
+                continue
             except Exception as e:
                 logging.error(f"Error checking structure for code {pdb_id}: {e}")
                 continue
+            
             try:
                 chk_col.update_one({'_id': pdb_id}, {'$set': checker.summary}, upsert=True)
                 logging.info(f"Updated checking data for code {pdb_id}")
             except Exception as e:
                 logging.error(f"Error updating checking data for code {pdb_id}: {e}")
                 continue
+
             # Remove the temporary cif file
-            # os.remove(str_file)
-            sys.exit(0)
+            os.remove(str_file)
         except Exception as e:
             logging.error(f"Error processing code {pdb_id}: {e}")
             continue
