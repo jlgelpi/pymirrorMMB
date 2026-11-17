@@ -10,8 +10,10 @@ import yaml
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
 from gridfs import GridFS
+from gridfs import GridFSBucket
 
-CONNECT_TIMEOUT_MS = 20000
+
+CONNECT_TIMEOUT_MS = 0
 SERVER_SELECTION_TIMEOUT_MS = 2000
 
 def _load_secrets():
@@ -74,8 +76,17 @@ class MongoDB():
         return dbs
 
     def get_gfs(self, col_name='fs'):
-        ''' Get GridFS collection '''
-        return GridFS(self.db, col_name, disable_md5=True)
+        ''' Get GridFS bucket '''
+        if not self.connected:
+            self._db_connect()
+        try:
+            return GridFSBucket(
+                self.db,
+                bucket_name=col_name,
+            )
+        except Exception as e:
+            print(f"Error getting GridFS bucket: {e}")
+            return None
 
     def _db_connect(self):
         if not self.uri:
